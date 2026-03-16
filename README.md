@@ -312,6 +312,55 @@ The library polls the status register before each byte — no interrupts require
 
 ---
 
+## Memory Management Unit (MMU)
+
+CPUTwo includes a software-compatible Sv32-style MMU, enabled by writing the `SATP` supervisor register at `0x03FFF018`. The MMU is disabled at reset (SATP = 0), so all existing programs run unchanged.
+
+### Features
+
+- **Two-level page tables** — Sv32-compatible layout: a 1024-entry L1 table points to 1024-entry L2 tables. Page table entries are 32-bit words with PPN in bits [31:12] and flags in bits [11:0]. Structure is directly compatible with xv6's `pte_t` type and RISC-V Sv32 page tables.
+- **4 KB pages** — The standard translation unit. Physical address = `L2_PTE.PPN << 12 | VA[11:0]`.
+- **4 MB superpages** — An L1 PTE with any of R/W/X set is a leaf entry mapping 4 MB directly. Useful for mapping large kernel regions with a single TLB entry.
+- **User/supervisor protection** — Each PTE has a U bit. User-mode accesses to pages with U=0 raise a page fault. Supervisor mode can access any page.
+- **Per-access permission bits** — R (readable), W (writable), X (executable) are checked on every access; mismatches raise load/store/fetch page faults (causes 0x08, 0x09, 0x07).
+- **Hardware dirty bit** — The emulator sets the D bit (PTE bit 1) in the page table entry in physical memory on the first store to a page. OS page-reclaim code can check D to decide whether to write the page to disk.
+- **SFENCE instruction** (opcode 0x3E) — Flushes all non-global TLB entries. Supervisor-mode only; user-mode execution raises an illegal instruction exception. Used after modifying page table entries.
+- **64-entry TLB** — Direct-mapped cache of recent page table walks. Global entries (PTE G=1) are not flushed by SFENCE or SATP writes, so kernel mappings persist across context switches.
+- **MMIO bypass** — Virtual addresses `>= 0x03F00000` are always treated as physical, bypassing the MMU even when SATP.EN=1. This makes UART, timer, interrupt controller, and supervisor registers permanently accessible without page table entries.
+
+### SATP register
+
+```
+Bit 31:    EN — 1 = MMU enabled
+Bits 30:20: reserved (must be zero)
+Bits 19:0:  PPN — physical page number of the root L1 page table
+```
+
+Write SATP to enable translation:
+
+```asm
+; point SATP at L1 table at physical address 0x00010000 (PPN = 0x10)
+MOVI32 r0, 0x03FFF018     ; SATP address
+MOVI32 r1, 0x80000010     ; EN=1, PPN=0x10
+SW     r1, [r0]           ; enable MMU (also flushes non-global TLB)
+```
+
+### New exception causes
+
+| Code | Name | BADADDR written |
+|------|------|----------------|
+| 0x07 | Instruction page fault | Faulting virtual PC |
+| 0x08 | Load page fault | Faulting virtual address |
+| 0x09 | Store page fault | Faulting virtual address |
+
+`BADADDR` (`0x03FFF01C`) is read-only; hardware writes the faulting virtual address before dispatching the handler via EVEC.
+
+### xv6 compatibility note
+
+The PTE layout and two-level walk are intentionally compatible with RISC-V Sv32 as used by xv6-riscv. An xv6 port to CPUTwo can reuse its `vm.c` page table management code nearly verbatim, with only the physical memory allocator and trap entry/exit needing adaptation for the CPUTwo register conventions.
+
+---
+
 ## Tests
 
 ```

@@ -20,6 +20,33 @@
 
 static unsigned char mem[MEM_SIZE];
 
+/* ── TLB ─────────────────────────────────────────────────────────────────── */
+#define TLB_SIZE 64
+
+typedef struct {
+    uint32_t va_tag;   /* VA page number (VA >> 12) */
+    uint32_t pa;       /* Physical page base (PTE.PPN << 12) */
+    uint32_t flags;    /* PTE bits [11:0] */
+    int      valid;
+    int      global;   /* G bit — not flushed by SFENCE */
+    int      superpage; /* 1 = 4 MB superpage */
+    uint32_t sp_pa_base; /* for superpages: PA base */
+} TLBEntry;
+
+static TLBEntry tlb[TLB_SIZE];
+
+static void tlb_flush_non_global(void) {
+    for (int i = 0; i < TLB_SIZE; i++) {
+        if (!tlb[i].global)
+            tlb[i].valid = 0;
+    }
+}
+
+static void tlb_flush_all(void) {
+    for (int i = 0; i < TLB_SIZE; i++)
+        tlb[i].valid = 0;
+}
+
 /* ── CPU State ───────────────────────────────────────────────────────────── */
 typedef struct {
     uint32_t r[16];     /* r0-r12 GPR, r13=sp, r14=lr, r15=pc */
@@ -33,6 +60,10 @@ typedef struct {
     uint32_t estatus;    /* STATUS saved on exception entry; restored by SYSRET */
     uint32_t uart_poll_divider; /* counts instructions; poll only every 1000 */
     uint32_t faulting_pc; /* PC of the currently-executing instruction */
+
+    /* MMU */
+    uint32_t satp;      /* bit31=EN, bits[19:0]=PPN of root L1 page table */
+    uint32_t badaddr;   /* faulting virtual address (read-only to guest) */
 
     /* UART device */
     uint32_t uart_control;  /* bit0=RX irq en, bit1=TX irq en */
@@ -130,10 +161,202 @@ static inline void update_flags_sub(CPU *cpu, uint32_t a, uint32_t b, uint32_t r
                | (overflow             ? FLAG_V : 0);
 }
 
+/* ── MMU ─────────────────────────────────────────────────────────────────── */
+
+/* access_type: 0=fetch, 1=load, 2=store */
+/* Returns 1 on success (pa filled), 0 on page fault (exception already raised) */
+static int mmu_translate(CPU *cpu, uint32_t va, int access_type, uint32_t *pa_out) {
+    /* If MMU disabled, pass through */
+    if (!(cpu->satp & 0x80000000u)) {
+        *pa_out = va;
+        return 1;
+    }
+
+    /* MMIO region always bypasses MMU */
+    if (va >= MMIO_BASE) {
+        *pa_out = va;
+        return 1;
+    }
+
+    /* Check TLB first */
+    uint32_t va_vpn = va >> 12;
+    int tlb_idx = (int)(va_vpn % TLB_SIZE);
+    TLBEntry *te = &tlb[tlb_idx];
+    if (te->valid && te->va_tag == va_vpn) {
+        uint32_t flags = te->flags;
+        /* Permission checks */
+        int user_mode = !(cpu->status & 1);
+        if (user_mode && !(flags & (1u << 8))) {
+            /* U bit not set — user mode page fault */
+            cpu->badaddr = va;
+            uint32_t cause = (access_type == 0) ? 0x07 : (access_type == 1) ? 0x08 : 0x09;
+            raise_exception(cpu, cause);
+            return 0;
+        }
+        if (access_type == 0 && !(flags & (1u << 7))) { /* X bit */
+            cpu->badaddr = va;
+            raise_exception(cpu, 0x07);
+            return 0;
+        }
+        if (access_type == 1 && !(flags & (1u << 5))) { /* R bit */
+            cpu->badaddr = va;
+            raise_exception(cpu, 0x08);
+            return 0;
+        }
+        if (access_type == 2 && !(flags & (1u << 6))) { /* W bit */
+            cpu->badaddr = va;
+            raise_exception(cpu, 0x09);
+            return 0;
+        }
+        /* Set D bit on store */
+        if (access_type == 2 && !(flags & (1u << 1))) {
+            te->flags |= (1u << 1);
+            /* Write D bit back to physical PTE — stored in te->pa is the PTE address */
+            /* We stored the PTE physical address in te->sp_pa_base when not superpage,
+               or in the superpage path. For simplicity, re-do a quick walk to set D.
+               Actually, we stored the PTE physical address in sp_pa_base for both cases. */
+            if (te->sp_pa_base < MEM_SIZE - 3) {
+                uint32_t pte = mem_read32(te->sp_pa_base);
+                pte |= (1u << 1); /* set D */
+                mem_write32(te->sp_pa_base, pte);
+            }
+        }
+        if (te->superpage) {
+            *pa_out = te->sp_pa_base | (va & 0x3FFFFFu); /* VA[21:0] */
+        } else {
+            *pa_out = te->pa | (va & 0xFFFu);
+        }
+        return 1;
+    }
+
+    /* TLB miss — do page table walk */
+    uint32_t l1_base = (cpu->satp & 0x000FFFFFu) << 12;
+    uint32_t vpn1    = (va >> 22) & 0x3FFu;  /* VA[31:22] */
+    uint32_t vpn2    = (va >> 12) & 0x3FFu;  /* VA[21:12] */
+
+    /* Read L1 PTE (physical memory access, bypasses MMU) */
+    uint32_t l1_pte_addr = l1_base + vpn1 * 4;
+    if (l1_pte_addr + 3 >= MEM_SIZE || l1_pte_addr >= MMIO_BASE) {
+        cpu->badaddr = va;
+        uint32_t cause = (access_type == 0) ? 0x07 : (access_type == 1) ? 0x08 : 0x09;
+        raise_exception(cpu, cause);
+        return 0;
+    }
+    uint32_t l1_pte = mem_read32(l1_pte_addr);
+
+    /* V bit check */
+    if (!(l1_pte & 1u)) {
+        cpu->badaddr = va;
+        uint32_t cause = (access_type == 0) ? 0x07 : (access_type == 1) ? 0x08 : 0x09;
+        raise_exception(cpu, cause);
+        return 0;
+    }
+
+    /* Superpage check: if R|W|X != 0 in L1 PTE, it's a 4 MB superpage */
+    if (l1_pte & (7u << 5)) { /* bits [7:5] = X|W|R */
+        /* 4 MB superpage */
+        uint32_t ppn = (l1_pte >> 12) & 0xFFFFFu;
+        /* PA = { PPN[19:10], VA[21:0] } */
+        uint32_t pa = ((ppn & 0xFFC00u) << 12) | (va & 0x3FFFFFu);
+
+        /* Permission checks */
+        int user_mode = !(cpu->status & 1);
+        if (user_mode && !(l1_pte & (1u << 8))) {
+            cpu->badaddr = va;
+            uint32_t cause = (access_type == 0) ? 0x07 : (access_type == 1) ? 0x08 : 0x09;
+            raise_exception(cpu, cause);
+            return 0;
+        }
+        if (access_type == 0 && !(l1_pte & (1u << 7))) {
+            cpu->badaddr = va; raise_exception(cpu, 0x07); return 0;
+        }
+        if (access_type == 1 && !(l1_pte & (1u << 5))) {
+            cpu->badaddr = va; raise_exception(cpu, 0x08); return 0;
+        }
+        if (access_type == 2 && !(l1_pte & (1u << 6))) {
+            cpu->badaddr = va; raise_exception(cpu, 0x09); return 0;
+        }
+
+        /* Set D on store */
+        if (access_type == 2 && !(l1_pte & (1u << 1))) {
+            l1_pte |= (1u << 1);
+            mem_write32(l1_pte_addr, l1_pte);
+        }
+
+        /* Update TLB */
+        te->va_tag    = va_vpn;
+        te->pa        = 0; /* unused for superpage */
+        te->sp_pa_base = l1_pte_addr; /* PTE address for D-bit updates */
+        te->flags     = l1_pte & 0xFFFu;
+        te->valid     = 1;
+        te->global    = (l1_pte >> 9) & 1;
+        te->superpage = 1;
+        *pa_out = pa;
+        return 1;
+    }
+
+    /* Non-leaf L1 PTE: walk to L2 */
+    uint32_t l2_base     = ((l1_pte >> 12) & 0xFFFFFu) << 12;
+    uint32_t l2_pte_addr = l2_base + vpn2 * 4;
+    if (l2_pte_addr + 3 >= MEM_SIZE || l2_pte_addr >= MMIO_BASE) {
+        cpu->badaddr = va;
+        uint32_t cause = (access_type == 0) ? 0x07 : (access_type == 1) ? 0x08 : 0x09;
+        raise_exception(cpu, cause);
+        return 0;
+    }
+    uint32_t l2_pte = mem_read32(l2_pte_addr);
+
+    /* V bit check */
+    if (!(l2_pte & 1u)) {
+        cpu->badaddr = va;
+        uint32_t cause = (access_type == 0) ? 0x07 : (access_type == 1) ? 0x08 : 0x09;
+        raise_exception(cpu, cause);
+        return 0;
+    }
+
+    /* Permission checks */
+    int user_mode = !(cpu->status & 1);
+    if (user_mode && !(l2_pte & (1u << 8))) {
+        cpu->badaddr = va;
+        uint32_t cause = (access_type == 0) ? 0x07 : (access_type == 1) ? 0x08 : 0x09;
+        raise_exception(cpu, cause);
+        return 0;
+    }
+    if (access_type == 0 && !(l2_pte & (1u << 7))) {
+        cpu->badaddr = va; raise_exception(cpu, 0x07); return 0;
+    }
+    if (access_type == 1 && !(l2_pte & (1u << 5))) {
+        cpu->badaddr = va; raise_exception(cpu, 0x08); return 0;
+    }
+    if (access_type == 2 && !(l2_pte & (1u << 6))) {
+        cpu->badaddr = va; raise_exception(cpu, 0x09); return 0;
+    }
+
+    /* Set D on store */
+    if (access_type == 2 && !(l2_pte & (1u << 1))) {
+        l2_pte |= (1u << 1);
+        mem_write32(l2_pte_addr, l2_pte);
+    }
+
+    uint32_t ppn = (l2_pte >> 12) & 0xFFFFFu;
+    uint32_t pa  = (ppn << 12) | (va & 0xFFFu);
+
+    /* Update TLB */
+    te->va_tag    = va_vpn;
+    te->pa        = ppn << 12;
+    te->sp_pa_base = l2_pte_addr; /* PTE address for D-bit updates */
+    te->flags     = l2_pte & 0xFFFu;
+    te->valid     = 1;
+    te->global    = (l2_pte >> 9) & 1;
+    te->superpage = 0;
+    *pa_out = pa;
+    return 1;
+}
+
 /* ── MMIO ────────────────────────────────────────────────────────────────── */
 static uint32_t mmio_read(CPU *cpu, uint32_t addr) {
     /* Supervisor registers */
-    if (addr >= SV_BASE && addr <= SV_BASE+0x14) {
+    if (addr >= SV_BASE && addr <= SV_BASE+0x1C) {
         if (!(cpu->status & 1)) { raise_exception(cpu, 0x02); return 0; }
         switch (addr - SV_BASE) {
             case 0x00: return cpu->epc;
@@ -142,6 +365,8 @@ static uint32_t mmio_read(CPU *cpu, uint32_t addr) {
             case 0x0C: return cpu->cause;
             case 0x10: return cpu->status;
             case 0x14: return cpu->estatus;
+            case 0x18: return cpu->satp;
+            case 0x1C: return cpu->badaddr;
         }
         return 0;
     }
@@ -195,7 +420,7 @@ static uint32_t mmio_read(CPU *cpu, uint32_t addr) {
 
 static void mmio_write(CPU *cpu, uint32_t addr, uint32_t val) {
     /* Supervisor registers */
-    if (addr >= SV_BASE && addr <= SV_BASE+0x14) {
+    if (addr >= SV_BASE && addr <= SV_BASE+0x1C) {
         if (!(cpu->status & 1)) { raise_exception(cpu, 0x02); return; }
         switch (addr - SV_BASE) {
             case 0x00: cpu->epc    = val; break;
@@ -204,6 +429,11 @@ static void mmio_write(CPU *cpu, uint32_t addr, uint32_t val) {
             case 0x0C: break; /* cause read-only */
             case 0x10: cpu->status = val; break;
             case 0x14: cpu->estatus = val; break;
+            case 0x18:
+                cpu->satp = val;
+                tlb_flush_non_global(); /* writing SATP flushes non-global TLB entries */
+                break;
+            case 0x1C: break; /* badaddr read-only */
         }
         return;
     }
@@ -273,40 +503,61 @@ static void mmio_write(CPU *cpu, uint32_t addr, uint32_t val) {
     }
 }
 
-/* ── Memory access with fault checking ──────────────────────────────────── */
+/* ── Memory access with fault checking + MMU translation ────────────────── */
 static uint32_t cpu_read32(CPU *cpu, uint32_t addr) {
-    if (addr >= MEM_SIZE)           { raise_exception(cpu, 0x02); return 0; }
-    if (addr & 3)                   { raise_exception(cpu, 0x01); return 0; }
-    if (addr >= MMIO_BASE)          return mmio_read(cpu, addr);
-    return mem_read32(addr);
+    uint32_t pa;
+    if (!mmu_translate(cpu, addr, 1, &pa)) return 0; /* page fault raised */
+    if (pa >= MEM_SIZE)           { raise_exception(cpu, 0x02); return 0; }
+    if (pa & 3)                   { raise_exception(cpu, 0x01); return 0; }
+    if (pa >= MMIO_BASE)          return mmio_read(cpu, pa);
+    return mem_read32(pa);
 }
 static uint16_t cpu_read16(CPU *cpu, uint32_t addr) {
-    if (addr >= MEM_SIZE)           { raise_exception(cpu, 0x02); return 0; }
-    if (addr & 1)                   { raise_exception(cpu, 0x01); return 0; }
-    if (addr >= MMIO_BASE)          return (uint16_t)mmio_read(cpu, addr);
-    return mem_read16(addr);
+    uint32_t pa;
+    if (!mmu_translate(cpu, addr, 1, &pa)) return 0;
+    if (pa >= MEM_SIZE)           { raise_exception(cpu, 0x02); return 0; }
+    if (pa & 1)                   { raise_exception(cpu, 0x01); return 0; }
+    if (pa >= MMIO_BASE)          return (uint16_t)mmio_read(cpu, pa);
+    return mem_read16(pa);
 }
 static uint8_t cpu_read8(CPU *cpu, uint32_t addr) {
-    if (addr >= MEM_SIZE)           { raise_exception(cpu, 0x02); return 0; }
-    if (addr >= MMIO_BASE)          return (uint8_t)mmio_read(cpu, addr);
-    return mem_read8(addr);
+    uint32_t pa;
+    if (!mmu_translate(cpu, addr, 1, &pa)) return 0;
+    if (pa >= MEM_SIZE)           { raise_exception(cpu, 0x02); return 0; }
+    if (pa >= MMIO_BASE)          return (uint8_t)mmio_read(cpu, pa);
+    return mem_read8(pa);
 }
 static void cpu_write32(CPU *cpu, uint32_t addr, uint32_t val) {
-    if (addr >= MEM_SIZE)           { raise_exception(cpu, 0x02); return; }
-    if (addr & 3)                   { raise_exception(cpu, 0x01); return; }
-    if (addr >= MMIO_BASE)          { mmio_write(cpu, addr, val); return; }
-    mem_write32(addr, val);
+    uint32_t pa;
+    if (!mmu_translate(cpu, addr, 2, &pa)) return;
+    if (pa >= MEM_SIZE)           { raise_exception(cpu, 0x02); return; }
+    if (pa & 3)                   { raise_exception(cpu, 0x01); return; }
+    if (pa >= MMIO_BASE)          { mmio_write(cpu, pa, val); return; }
+    mem_write32(pa, val);
 }
 static void cpu_write16(CPU *cpu, uint32_t addr, uint16_t val) {
-    if (addr >= MEM_SIZE)           { raise_exception(cpu, 0x02); return; }
-    if (addr & 1)                   { raise_exception(cpu, 0x01); return; }
-    if (addr >= MMIO_BASE)          { mmio_write(cpu, addr, val); return; }
-    mem_write16(addr, val);
+    uint32_t pa;
+    if (!mmu_translate(cpu, addr, 2, &pa)) return;
+    if (pa >= MEM_SIZE)           { raise_exception(cpu, 0x02); return; }
+    if (pa & 1)                   { raise_exception(cpu, 0x01); return; }
+    if (pa >= MMIO_BASE)          { mmio_write(cpu, pa, val); return; }
+    mem_write16(pa, val);
 }
 static void cpu_write8(CPU *cpu, uint32_t addr, uint8_t val) {
-    if (addr >= MEM_SIZE)           { raise_exception(cpu, 0x02); return; }
-    if (addr >= MMIO_BASE)          { mmio_write(cpu, addr, val); return; }
-    mem_write8(addr, val);
+    uint32_t pa;
+    if (!mmu_translate(cpu, addr, 2, &pa)) return;
+    if (pa >= MEM_SIZE)           { raise_exception(cpu, 0x02); return; }
+    if (pa >= MMIO_BASE)          { mmio_write(cpu, pa, val); return; }
+    mem_write8(pa, val);
+}
+
+/* Instruction fetch with MMU (access_type=0=fetch) */
+static int cpu_fetch(CPU *cpu, uint32_t pc, uint32_t *instr_out) {
+    uint32_t pa;
+    if (!mmu_translate(cpu, pc, 0, &pa)) return 0; /* page fault dispatched */
+    if (pa >= MEM_SIZE) { raise_exception(cpu, 0x02); return 0; }
+    *instr_out = mem_read32(pa);
+    return 1;
 }
 
 /* ── UART RX poll (non-blocking stdin check) ─────────────────────────────── */
@@ -440,6 +691,7 @@ static void disasm(uint32_t addr, uint32_t instr, char *buf, size_t sz) {
         case 0x3B: snprintf(buf,sz,"ROLI %s,%s,%u",reg_name(rd),reg_name(rs1),shift); break;
         case 0x3C: snprintf(buf,sz,"RORI %s,%s,%u",reg_name(rd),reg_name(rs1),shift); break;
         case 0x3D: snprintf(buf,sz,"CAS  %s,%s,%s",reg_name(rd),reg_name(rs1),reg_name(rs2)); break;
+        case 0x3E: snprintf(buf,sz,"SFENCE"); break;
         default:   snprintf(buf,sz,"??? (0x%08X)",instr); break;
     }
 }
@@ -456,6 +708,8 @@ static void dump_regs(CPU *cpu) {
     }
     fprintf(stderr, "  flags=0x%08X  status=0x%08X  cause=0x%08X\n",
             cpu->flags, cpu->status, cpu->cause);
+    fprintf(stderr, "  satp=0x%08X  badaddr=0x%08X\n",
+            cpu->satp, cpu->badaddr);
 }
 
 static void dump_mem(uint32_t addr, int len) {
@@ -541,11 +795,18 @@ static void cpu_run(CPU *cpu, int debug) {
             if (debug_step) debugger_prompt(cpu, debug_step);
             if (cpu->halted) break;
             pc = cpu->r[15]; /* may have changed in debugger */
+            cpu->faulting_pc = pc;
         }
 
-        /* fetch */
-        if (pc >= MEM_SIZE) { raise_exception(cpu, 0x02); timer_tick(cpu); interrupt_check(cpu); continue; }
-        uint32_t instr = mem_read32(pc);
+        /* fetch — with MMU translation (access_type=0) */
+        uint32_t instr;
+        if (!cpu_fetch(cpu, pc, &instr)) {
+            /* page fault or bus error dispatched; do housekeeping and continue */
+            timer_tick(cpu);
+            if (++cpu->uart_poll_divider >= 1000) { cpu->uart_poll_divider = 0; uart_poll(cpu); }
+            if (!cpu->halted) interrupt_check(cpu);
+            continue;
+        }
         cpu->r[15] = pc + 4;
 
         /* decode */
@@ -634,6 +895,16 @@ static void cpu_run(CPU *cpu, int debug) {
                 cpu->r[rd] = cur;
                 cpu->flags &= ~FLAG_Z;
             }
+            break;
+        }
+
+        /* ── SFENCE ── */
+        case 0x3E: { /* SFENCE — flush non-global TLB entries */
+            if (!(cpu->status & 1)) { /* user mode — illegal instruction */
+                raise_exception(cpu, 0x00);
+                break;
+            }
+            tlb_flush_non_global();
             break;
         }
 
@@ -744,6 +1015,8 @@ static void cpu_reset(CPU *cpu) {
     memset(cpu, 0, sizeof(*cpu));
     cpu->status = 0x01; /* supervisor, IE=0 */
     cpu->estatus = 0x02; /* user-mode + IE=1; default for first SYSRET */
+    /* satp = 0: MMU disabled (EN bit = 0) */
+    tlb_flush_all();
 }
 
 /* ── ELF loader ──────────────────────────────────────────────────────────── */

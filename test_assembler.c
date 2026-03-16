@@ -256,6 +256,9 @@ static void test_nooperand(void) {
 
     ASSERT(do_asm("SYSRET",  buf, BUFSZ, &blen) == 0, "SYSRET: no errors");
     ASSERT(read_word(buf,0) == 0x11000000,         "SYSRET encoding");
+
+    ASSERT(do_asm("SFENCE",  buf, BUFSZ, &blen) == 0, "SFENCE: no errors");
+    ASSERT(read_word(buf,0) == 0x3E000000,         "SFENCE encoding");
 }
 
 /* ─────────────────────────────────────────────────────────────────────────── */

@@ -210,6 +210,7 @@ static const OpcodeEntry opcode_table[] = {
     { "ROLI",    0x3B, FMT_RSHIFT,   -1 },
     { "RORI",    0x3C, FMT_RSHIFT,   -1 },
     { "CAS",     0x3D, FMT_R3,       -1 },
+    { "SFENCE",  0x3E, FMT_NONE,     -1 },
     /* Pseudo-instructions */
     { "RET",     0x27, FMT_RET,       -1 },   /* MOV pc, lr  */
     { "BR",      0x27, FMT_BR,        -1 },   /* MOV pc, rs1 */

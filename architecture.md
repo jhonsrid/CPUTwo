@@ -15,6 +15,7 @@ At power-on / emulator start, all registers and memory are initialised to zero e
 - All general-purpose registers (`r0`–`r14`) = 0
 - `flags` = 0
 - `EPC`, `EFLAGS`, `EVEC`, `CAUSE` = 0
+- `SATP` = 0 — **MMU disabled** (EN bit = 0); all accesses are physical until supervisor code explicitly enables translation
 
 Starts in supervisor mode so startup code can initialise `EVEC` and the stack before dropping to user mode. No interrupts fire until software sets `STATUS.IE` = 1.
 
@@ -67,6 +68,8 @@ Supervisor registers are **memory-mapped** into the CPU control region at `0x03F
 | `0x03FFF00C` | `CAUSE` | Most recent exception cause code. **Read-only** — writes ignored. |
 | `0x03FFF010` | `STATUS` | Bit 0 = privilege (0 = User, 1 = Supervisor); bit 1 = IE (1 = interrupts enabled); bits 31–2 reserved. **Read/write.** |
 | `0x03FFF014` | `ESTATUS` | Exception-entry snapshot of `STATUS`. Saved automatically on every exception entry; restored by SYSRET (with bit 0 forced clear). **Read/write**: write before SYSRET to control the IE bit the returning task will see. |
+| `0x03FFF018` | `SATP` | Supervisor Address Translation & Protection. Bit 31 = EN (1 = MMU enabled). Bits [19:0] = PPN of root L1 page table (physical address of L1 table = PPN << 12). Writing SATP implicitly flushes all non-global TLB entries. Reset value = 0 (MMU disabled). **Read/write.** |
+| `0x03FFF01C` | `BADADDR` | Faulting virtual address — written by hardware on page fault (causes 0x07–0x09). **Read-only**; writes ignored. |
 
 ---
 
@@ -173,6 +176,7 @@ R-type register operand and I-type immediate operand variants are **separate opc
 | 0x3B | ROLI  | R | `rd = (rs1 << sh) \| (rs1 >> (32 - sh))` — rotate left by immediate (shift field, 0..31) |
 | 0x3C | RORI  | R | `rd = (rs1 >> sh) \| (rs1 << (32 - sh))` — rotate right by immediate (shift field, 0..31) |
 | 0x3D | CAS | R | Atomic compare-and-swap: `tmp = mem32[rs1]`; if `tmp == rd` then `mem32[rs1] = rs2`, `Z=1`; else `rd = tmp`, `Z=0`. Raises misaligned (cause 1) if `rs1` is not word-aligned. N, C, V unchanged. |
+| 0x3E | SFENCE | — | Flush all TLB entries where G=0. No-op if MMU disabled. **Supervisor mode only** — raises illegal instruction (cause 0x00) if executed in user mode. All bits below the opcode are reserved and must be zero. |
 
 Indexed memory instructions use the **R-type** encoding with `rs2` as the index register instead of an immediate offset. Alignment rules are identical to their non-indexed counterparts: LWX/SWX require 4-byte alignment, LHX/LHUX/SHX require 2-byte alignment, byte operations have no alignment requirement.
 
@@ -382,12 +386,122 @@ The interrupt controller's enable mask (`0x03F02004`) is checked as part of step
 | 0x04 | Divide by zero | `DIV`, `DIVU`, `MOD`, or `MODU` with zero divisor |
 | 0x05 | Halt | `HALT` instruction — not a true exception; stops the emulator cleanly |
 | 0x06 | Hardware interrupt | Any unmasked hardware interrupt fired — read IC pending register (`0x03F02000`) to identify source: bit 0 = timer, bit 1 = UART RX, bit 2 = UART TX, bit 3 = block device |
+| 0x07 | Instruction page fault | Instruction fetch failed MMU permission check or page table walk; `BADADDR` = faulting virtual PC |
+| 0x08 | Load page fault | Load instruction failed MMU permission check or page table walk; `BADADDR` = faulting virtual address |
+| 0x09 | Store page fault | Store instruction failed MMU permission check or page table walk; `BADADDR` = faulting virtual address |
 
-Cause codes 0x07 and above are reserved for future use.
+Cause codes 0x0A and above are reserved for future use.
 
 ### No Shadow Registers
 
 There are no shadow or banked registers. An OS context-switch must save and restore all registers in software.
+
+---
+
+## Memory Management Unit (MMU)
+
+### Overview
+
+CPUTwo supports optional two-level virtual memory via the `SATP` supervisor register. When `SATP.EN` = 0 (the reset state), all addresses are physical and the MMU is bypassed entirely — all existing programs run unchanged. When `SATP.EN` = 1, every instruction fetch and every load/store is translated through the page table, except for the MMIO region which always bypasses translation.
+
+The design is Sv32-compatible: 32-bit virtual addresses, 4 KB pages, two-level page tables, with optional 4 MB superpages.
+
+### SATP Register (`0x03FFF018`)
+
+| Bits | Field | Description |
+|------|-------|-------------|
+| 31   | EN    | 1 = MMU enabled; 0 = all accesses are physical (reset state) |
+| 30:20 | — | Reserved, must be zero |
+| 19:0 | PPN   | Physical page number of the root L1 page table. L1 table physical address = PPN << 12. |
+
+Writing SATP flushes all non-global TLB entries (equivalent to SFENCE).
+
+### MMIO Region Bypass
+
+Virtual addresses `>= 0x03F00000` always bypass MMU translation and are treated as physical addresses, regardless of `SATP.EN`. This ensures that MMIO and supervisor registers are always reachable in supervisor mode without requiring page table entries.
+
+### Virtual Address Layout
+
+```
+ 31      22 21      12 11         0
++----------+----------+------------+
+| VPN[1]   | VPN[0]   |   offset   |
+| (10 bits)| (10 bits)| (12 bits)  |
++----------+----------+------------+
+  L1 index   L2 index   page offset
+```
+
+- `VA[31:22]` = L1 index — indexes into the root (L1) page table (1024 entries)
+- `VA[21:12]` = L2 index — indexes into the leaf (L2) page table (1024 entries)
+- `VA[11:0]`  = byte offset within the 4 KB page
+
+### Page Table Walk
+
+1. L1 table base = `SATP.PPN << 12`
+2. L1 PTE address = L1 base + `VA[31:22] * 4`
+3. Read L1 PTE from **physical** memory (walk itself bypasses MMU)
+4. If `L1_PTE.V == 0`: page fault
+5. If `L1_PTE.R | L1_PTE.W | L1_PTE.X != 0`: **4 MB superpage** (see below)
+6. Otherwise (non-leaf): L2 table base = `L1_PTE.PPN << 12`
+7. L2 PTE address = L2 base + `VA[21:12] * 4`
+8. Read L2 PTE from physical memory
+9. If `L2_PTE.V == 0`: page fault
+10. Physical address = `{ L2_PTE.PPN, VA[11:0] }` = `(L2_PTE.PPN << 12) | (VA & 0xFFF)`
+
+### PTE Bit Layout (32-bit word)
+
+| Bits  | Field | Description |
+|-------|-------|-------------|
+| 31:12 | PPN   | Physical page number — PA = `PPN << 12 | offset` |
+| 11:10 | RSW   | Reserved for software; hardware ignores |
+| 9     | G     | Global — entry is **not** flushed by SFENCE or SATP write |
+| 8     | U     | User-accessible — if 0, user-mode access raises page fault |
+| 7     | X     | Executable — checked on instruction fetch |
+| 6     | W     | Writable — checked on stores; hardware sets D=1 on first write |
+| 5     | R     | Readable — checked on loads |
+| 4:2   | —     | Reserved, must be zero |
+| 1     | D     | Dirty — hardware sets to 1 on any store to this page |
+| 0     | V     | Valid — if 0, all other bits ignored; access raises page fault |
+
+### Permission Checks
+
+After a successful page table walk, before the access proceeds:
+
+| Mode | Required bits |
+|------|--------------|
+| User-mode load | U=1, R=1 |
+| User-mode store | U=1, W=1 (hardware also sets D=1) |
+| User-mode fetch | U=1, X=1 |
+| Supervisor-mode load | R=1 (U may be 0 or 1) |
+| Supervisor-mode store | W=1 (U may be 0 or 1; hardware sets D=1) |
+| Supervisor-mode fetch | X=1 (U may be 0 or 1) |
+
+If any required bit is not set, the access raises the appropriate page fault (cause 0x07/0x08/0x09) and `BADADDR` is written with the faulting virtual address.
+
+### 4 MB Superpages
+
+If an L1 PTE has any of R, W, or X set (i.e., it is a leaf entry at the L1 level), it maps a 4 MB superpage:
+
+- Physical address = `{ L1_PTE.PPN[19:10], VA[21:0] }` — upper 10 bits of PPN concatenated with the low 22 bits of the virtual address
+- `L1_PTE.PPN[9:0]` must be zero for correct alignment (software responsibility)
+- The same permission and U-bit rules apply as for 4 KB pages
+
+Superpages are useful for mapping large regions (kernel text, frame buffer) with a single TLB entry.
+
+### TLB and SFENCE
+
+The emulator maintains a 64-entry direct-mapped TLB. Each entry caches the result of a page table walk, including the G (global) bit.
+
+**Flushing rules:**
+- Writing `SATP` flushes all non-global (G=0) entries
+- `SFENCE` instruction flushes all non-global entries
+- Global entries (G=1) are never flushed by either
+
+An OS must execute SFENCE or write SATP after modifying page table entries to ensure stale TLB entries are not used.
+
+### Double Fault with Page Faults
+
+The standard double-fault rule applies: if a page fault (cause 0x07–0x09) occurs while the CPU is already in supervisor mode (STATUS bit 0 = 1), the CPU **halts immediately** without dispatching a handler. This prevents infinite recursive fault loops. Supervisor code must ensure its own instruction pages and data pages are always valid.
 
 ---
 
@@ -481,3 +595,7 @@ Typical init sequence: set device enable → set IC mask → set `STATUS.IE` las
 | EFLAGS supervisor register | SYSRET can restore user flags atomically without extra instructions |
 | Memory-mapped supervisor registers | No CSR instructions needed; normal LW/SW in supervisor mode are sufficient |
 | Double fault → halt | Simplest safe failure mode; avoids recursive exception machinery |
+| Sv32-compatible MMU | Two-level page tables with 4 KB pages and optional 4 MB superpages match the RISC-V Sv32 format, enabling direct reuse of xv6 and Linux page table code with minimal porting |
+| MMIO bypass (>= 0x03F00000) | Supervisor registers and devices are always accessible at their physical addresses regardless of SATP.EN — no need to map MMIO into every process's page table |
+| SATP write flushes TLB | Implicit flush on context switch; eliminates a separate required SFENCE in the common case |
+| G (global) TLB bit | Kernel mappings marked global survive SATP writes — avoids re-walking kernel page tables after every context switch |
