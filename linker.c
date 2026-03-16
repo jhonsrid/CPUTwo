@@ -19,21 +19,21 @@
 #define MAX_SECS      256   /* total sections across all objects */
 #define MAX_GLOB_SYMS 8192
 
-/* ── Big-endian helpers ──────────────────────────────────────────────────── */
+/* ── Little-endian helpers ───────────────────────────────────────────────── */
 static uint32_t rd32(FILE *f) {
     uint32_t a=(uint8_t)fgetc(f), b=(uint8_t)fgetc(f),
              c=(uint8_t)fgetc(f), d=(uint8_t)fgetc(f);
-    return (a<<24)|(b<<16)|(c<<8)|d;
+    return a|(b<<8)|(c<<16)|(d<<24);
 }
 static uint16_t rd16(FILE *f) {
     uint32_t a=(uint8_t)fgetc(f), b=(uint8_t)fgetc(f);
-    return (uint16_t)((a<<8)|b);
+    return (uint16_t)(a|(b<<8));
 }
 static uint32_t get32(const uint8_t *p) {
-    return ((uint32_t)p[0]<<24)|((uint32_t)p[1]<<16)|((uint32_t)p[2]<<8)|p[3];
+    return (uint32_t)p[0]|((uint32_t)p[1]<<8)|((uint32_t)p[2]<<16)|((uint32_t)p[3]<<24);
 }
 static void put32(uint8_t *p, uint32_t v) {
-    p[0]=(v>>24)&0xFF; p[1]=(v>>16)&0xFF; p[2]=(v>>8)&0xFF; p[3]=v&0xFF;
+    p[0]=v&0xFF; p[1]=(v>>8)&0xFF; p[2]=(v>>16)&0xFF; p[3]=(v>>24)&0xFF;
 }
 
 /* ── In-memory object representation ────────────────────────────────────── */

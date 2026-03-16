@@ -1,6 +1,6 @@
 /* CPUTwo Object File Format (.dobj) — shared constants
  *
- * Wire layout (all multi-byte fields big-endian):
+ * Wire layout (all multi-byte fields little-endian):
  *   [Header 24 B][SectionHeader × N, 24 B each][Symbol × N, 36 B each]
  *   [Reloc × N, 16 B each][section data blobs]
  */

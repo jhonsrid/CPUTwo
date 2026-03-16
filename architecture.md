@@ -26,7 +26,7 @@ Starts in supervisor mode so startup code can initialise `EVEC` and the stack be
 
 - **32-bit** words and addresses
 - **64 MB** addressable space (`0x00000000`–`0x03FFFFFF`); addresses ≥ `0x04000000` cause a bus error (cause 0x02)
-- **Byte-addressable**, big-endian (most-significant byte at lowest address)
+- **Byte-addressable**, little-endian (least-significant byte at lowest address)
 - Memory-mapped I/O (no separate I/O instructions)
 
 ---
@@ -476,7 +476,7 @@ Typical init sequence: set device enable → set IC mask → set `STATUS.IE` las
 | Memory-mapped I/O | No special IN/OUT instructions to implement |
 | Two privilege modes | Exactly what Linux needs, no more |
 | Vectored exceptions | Simple table lookup vs. complex trap handling |
-| Big-endian | Consistent MSB-first byte ordering simplifies binary inspection and cross-platform debugging |
+| Little-endian | Matches x86/ARM host byte order; simplifies C struct overlays and interop with host tools |
 | Separate R/I opcodes | Avoids a mode-select bit inside the encoding; each opcode has exactly one format |
 | EFLAGS supervisor register | SYSRET can restore user flags atomically without extra instructions |
 | Memory-mapped supervisor registers | No CSR instructions needed; normal LW/SW in supervisor mode are sufficient |

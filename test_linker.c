@@ -26,10 +26,10 @@ static int tests_failed = 0;
 typedef struct { uint8_t data[8192]; size_t len; } Buf;
 
 static void b_u8 (Buf *b, uint8_t  v) { b->data[b->len++] = v; }
-static void b_u16(Buf *b, uint16_t v) { b_u8(b,(v>>8)&0xFF); b_u8(b,v&0xFF); }
+static void b_u16(Buf *b, uint16_t v) { b_u8(b,v&0xFF); b_u8(b,(v>>8)&0xFF); }
 static void b_u32(Buf *b, uint32_t v) {
-    b_u8(b,(v>>24)&0xFF); b_u8(b,(v>>16)&0xFF);
-    b_u8(b,(v>> 8)&0xFF); b_u8(b,v&0xFF);
+    b_u8(b,v&0xFF); b_u8(b,(v>> 8)&0xFF);
+    b_u8(b,(v>>16)&0xFF); b_u8(b,(v>>24)&0xFF);
 }
 static void b_str(Buf *b, const char *s, int pad) {
     int i = 0;
@@ -120,12 +120,12 @@ static void linker_reset(void) {
     memset(glob_syms,  0, sizeof(glob_syms));
 }
 
-/* Read big-endian u32 from output binary at byte offset */
+/* Read little-endian u32 from output binary at byte offset */
 static uint32_t read_word(const uint8_t *buf, uint32_t byte_off) {
-    return ((uint32_t)buf[byte_off]   << 24)
-         | ((uint32_t)buf[byte_off+1] << 16)
-         | ((uint32_t)buf[byte_off+2] <<  8)
-         |  (uint32_t)buf[byte_off+3];
+    return  (uint32_t)buf[byte_off]
+         | ((uint32_t)buf[byte_off+1] <<  8)
+         | ((uint32_t)buf[byte_off+2] << 16)
+         | ((uint32_t)buf[byte_off+3] << 24);
 }
 
 /* ── Tests ─────────────────────────────────────────────────────────────────── */
@@ -133,7 +133,7 @@ static uint32_t read_word(const uint8_t *buf, uint32_t byte_off) {
 /* Single object, no relocations: output matches input section data */
 static void test_single_obj_no_relocs(void) {
     /* HALT instruction at address 0 */
-    uint8_t code[4] = {0x12, 0x00, 0x00, 0x00};  /* HALT */
+    uint8_t code[4] = {0x00, 0x00, 0x00, 0x12};  /* HALT */
     write_test_dobj("/tmp/t1.dobj", 0, code, 4, NULL, 0, NULL, 0);
 
     linker_reset();
@@ -154,7 +154,7 @@ static void test_single_obj_no_relocs(void) {
 
 /* Single object with vma_hint: section placed at vma_hint */
 static void test_vma_hint(void) {
-    uint8_t code[4] = {0x12, 0x00, 0x00, 0x00};
+    uint8_t code[4] = {0x00, 0x00, 0x00, 0x12};
     write_test_dobj("/tmp/t2.dobj", 0x1000, code, 4, NULL, 0, NULL, 0);
 
     linker_reset();
@@ -169,7 +169,7 @@ static void test_abs32_reloc(void) {
        0000: HALT            (4 bytes)
        0004: word32 = 0      (placeholder — ABS32 reloc → label 'target' = sec_off 0)
     */
-    uint8_t code[8] = {0x12,0,0,0,  0,0,0,0};
+    uint8_t code[8] = {0,0,0,0x12,  0,0,0,0};
     TSym sym  = {"target", 0 /*sec_off=0*/, 0 /*sec 0*/, 0};
     TRel rel  = {4 /*offset*/, 0 /*sym_idx*/, RELOC_ABS32, 0 /*sec*/, 0 /*addend*/};
     write_test_dobj("/tmp/t3.dobj", 0, code, 8, &sym, 1, &rel, 1);
@@ -192,7 +192,7 @@ static void test_abs32_reloc(void) {
 /* RELOC_ABS32 with vma_hint: abs addr = vma + sec_offset */
 static void test_abs32_with_vma(void) {
     /* vma=0x4000, label at sec_off=0, .word placeholder at sec_off=4 */
-    uint8_t code[8] = {0x12,0,0,0,  0,0,0,0};
+    uint8_t code[8] = {0,0,0,0x12,  0,0,0,0};
     TSym sym  = {"lbl", 0, 0, 0};
     TRel rel  = {4, 0, RELOC_ABS32, 0, 0};
     write_test_dobj("/tmp/t4.dobj", 0x4000, code, 8, &sym, 1, &rel, 1);
@@ -221,9 +221,9 @@ static void test_movi32_reloc(void) {
        sec_off 8: HALT                        enc = 0x12000000
     */
     uint8_t code[12] = {
-        0x0F,0x10,0x00,0x00,   /* MOVI  r1, 0 */
-        0x13,0x10,0x00,0x00,   /* MOVHI r1, 0 */
-        0x12,0x00,0x00,0x00    /* HALT (= 'target') */
+        0x00,0x00,0x10,0x0F,   /* MOVI  r1, 0 */
+        0x00,0x00,0x10,0x13,   /* MOVHI r1, 0 */
+        0x00,0x00,0x00,0x12    /* HALT (= 'target') */
     };
     TSym sym = {"target", 8 /*sec_off*/, 0, 0};
     TRel rels[2] = {
@@ -254,13 +254,13 @@ static void test_movi32_reloc(void) {
    and a CALL _puts instruction (RELOC_JUMP20). */
 static void test_cross_call(void) {
     /* Object A: _puts at sec_off=0, vma=0x1000 */
-    uint8_t codeA[4] = {0x12,0,0,0};  /* HALT (= _puts body) */
+    uint8_t codeA[4] = {0,0,0,0x12};  /* HALT (= _puts body) */
     TSym symA = {"_puts", 0, 0, 1 /*global*/};
     write_test_dobj("/tmp/tA.dobj", 0x1000, codeA, 4, &symA, 1, NULL, 0);
 
     /* Object B: vma=0, CALL _puts at sec_off=0
-       JMP lr, 0  enc = 0x0E E0 00 00 (lr=14, offset=0) */
-    uint8_t codeB[4] = {0x0E,0xE0,0x00,0x00};
+       JMP lr, 0  enc = 0x0EE00000 (lr=14, offset=0) */
+    uint8_t codeB[4] = {0x00,0x00,0xE0,0x0E};
     TSym symB = {"_puts", 0, (uint16_t)DOBJ_SEC_UNDEF, 0 /*extern*/};
     TRel relB = {0, 0, RELOC_JUMP20, 0, 0};
     write_test_dobj("/tmp/tB.dobj", 0, codeB, 4, &symB, 1, &relB, 1);
@@ -289,7 +289,7 @@ static void test_cross_call(void) {
 
 /* Duplicate global symbol → link error */
 static void test_duplicate_global(void) {
-    uint8_t code[4] = {0x12,0,0,0};
+    uint8_t code[4] = {0,0,0,0x12};
     TSym sym = {"_foo", 0, 0, 1};
     write_test_dobj("/tmp/tDup1.dobj", 0, code, 4, &sym, 1, NULL, 0);
     write_test_dobj("/tmp/tDup2.dobj", 0x100, code, 4, &sym, 1, NULL, 0);
@@ -304,7 +304,7 @@ static void test_duplicate_global(void) {
 
 /* Undefined extern → link error */
 static void test_undefined_extern(void) {
-    uint8_t code[4] = {0x0E,0xE0,0x00,0x00};
+    uint8_t code[4] = {0x00,0x00,0xE0,0x0E};
     TSym sym = {"_missing", 0, (uint16_t)DOBJ_SEC_UNDEF, 0};
     TRel rel = {0, 0, RELOC_JUMP20, 0, 0};
     write_test_dobj("/tmp/tUndef.dobj", 0, code, 4, &sym, 1, &rel, 1);
@@ -320,12 +320,12 @@ static void test_undefined_extern(void) {
 /* RELOC_BRANCH20: BEQ to extern target */
 static void test_branch_reloc(void) {
     /* vma=0, BEQ r0,0 placeholder at offset=0, extern target at 0x100 */
-    uint8_t codeA[4] = {0x12,0,0,0};           /* HALT = target */
+    uint8_t codeA[4] = {0,0,0,0x12};           /* HALT = target */
     TSym symA = {"_tgt", 0, 0, 1};
     write_test_dobj("/tmp/tBrA.dobj", 0x100, codeA, 4, &symA, 1, NULL, 0);
 
     /* BEQ placeholder: opcode=0x0D, cond=0 (BEQ), offset=0 */
-    uint8_t codeB[4] = {0x0D,0x00,0x00,0x00};
+    uint8_t codeB[4] = {0x00,0x00,0x00,0x0D};
     TSym symB = {"_tgt", 0, (uint16_t)DOBJ_SEC_UNDEF, 0};
     TRel relB = {0, 0, RELOC_BRANCH20, 0, 0};
     write_test_dobj("/tmp/tBrB.dobj", 0, codeB, 4, &symB, 1, &relB, 1);

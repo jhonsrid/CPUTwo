@@ -28,13 +28,13 @@ static int do_asm(const char *src, uint8_t *buf, size_t bufsz, size_t *len) {
     return assemble_string(src, buf, bufsz, len);
 }
 
-/* Read big-endian 32-bit word at buf[idx*4] */
+/* Read little-endian 32-bit word at buf[idx*4] */
 static uint32_t read_word(uint8_t *buf, int idx) {
     int b = idx * 4;
-    return ((uint32_t)buf[b]   << 24)
-         | ((uint32_t)buf[b+1] << 16)
-         | ((uint32_t)buf[b+2] <<  8)
-         | ((uint32_t)buf[b+3]);
+    return  (uint32_t)buf[b]
+         | ((uint32_t)buf[b+1] <<  8)
+         | ((uint32_t)buf[b+2] << 16)
+         | ((uint32_t)buf[b+3] << 24);
 }
 
 #define BUFSZ (64*1024)

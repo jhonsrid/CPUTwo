@@ -77,7 +77,7 @@ JMP  lr, 0x00001000
 | `.org <addr>` | Set output address |
 | `.equ NAME, <val>` | Define a numeric constant (no bytes emitted) |
 | `.global NAME` | Mark symbol as global in the map file |
-| `.word <val>` | Emit one 32-bit big-endian word |
+| `.word <val>` | Emit one 32-bit little-endian word |
 | `.byte <val>` | Emit one byte |
 | `.space <n>` | Emit *n* zero bytes |
 | `.ascii "…"` | Emit string bytes (no null terminator) |

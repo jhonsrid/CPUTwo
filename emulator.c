@@ -58,20 +58,20 @@ typedef struct {
 
 /* ── Memory helpers ──────────────────────────────────────────────────────── */
 static inline uint32_t mem_read32(uint32_t addr) {
-    return ((uint32_t)mem[addr]<<24)|((uint32_t)mem[addr+1]<<16)|
-           ((uint32_t)mem[addr+2]<<8)|(uint32_t)mem[addr+3];
+    return (uint32_t)mem[addr]|((uint32_t)mem[addr+1]<<8)|
+           ((uint32_t)mem[addr+2]<<16)|((uint32_t)mem[addr+3]<<24);
 }
 static inline uint16_t mem_read16(uint32_t addr) {
-    return (uint16_t)(((uint32_t)mem[addr]<<8)|(uint32_t)mem[addr+1]);
+    return (uint16_t)((uint32_t)mem[addr]|((uint32_t)mem[addr+1]<<8));
 }
 static inline uint8_t mem_read8(uint32_t addr) { return mem[addr]; }
 
 static inline void mem_write32(uint32_t addr, uint32_t v) {
-    mem[addr]=(v>>24)&0xFF; mem[addr+1]=(v>>16)&0xFF;
-    mem[addr+2]=(v>>8)&0xFF; mem[addr+3]=v&0xFF;
+    mem[addr]=v&0xFF; mem[addr+1]=(v>>8)&0xFF;
+    mem[addr+2]=(v>>16)&0xFF; mem[addr+3]=(v>>24)&0xFF;
 }
 static inline void mem_write16(uint32_t addr, uint16_t v) {
-    mem[addr]=(v>>8)&0xFF; mem[addr+1]=v&0xFF;
+    mem[addr]=v&0xFF; mem[addr+1]=(v>>8)&0xFF;
 }
 static inline void mem_write8(uint32_t addr, uint8_t v) { mem[addr]=v; }
 

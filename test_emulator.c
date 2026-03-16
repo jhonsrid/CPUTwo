@@ -71,7 +71,7 @@ static void test_memory_rw(void) {
     memset(mem, 0, 16);
     mem_write32(0, 0xDEADBEEF);
     ASSERT(mem_read32(0) == 0xDEADBEEF, "mem_write32/read32 round-trip");
-    ASSERT(mem[0]==0xDE && mem[1]==0xAD && mem[2]==0xBE && mem[3]==0xEF, "big-endian byte order");
+    ASSERT(mem[0]==0xEF && mem[1]==0xBE && mem[2]==0xAD && mem[3]==0xDE, "little-endian byte order");
     mem_write16(4, 0x1234);
     ASSERT(mem_read16(4) == 0x1234, "mem_write16/read16");
     mem_write8(8, 0xAB);
@@ -388,18 +388,18 @@ static void test_load_widths(void) {
     mem_write32(0x3000, 0xDEADBEEF);
     uint32_t prog[] = {
         enc_i(0x0F, 0, 0, 0x3000),       /* r0 = 0x3000 */
-        enc_i(0x1D, 1, 0, 0),            /* LHU r1 = 0xDEAD */
-        enc_i(0x1C, 2, 0, 0),            /* LH  r2 = sign_ext(0xDEAD) = 0xFFFFDEAD */
-        enc_i(0x1F, 3, 0, 0),            /* LBU r3 = 0xDE */
-        enc_i(0x1E, 4, 0, 0),            /* LB  r4 = sign_ext(0xDE) = 0xFFFFFFDE */
+        enc_i(0x1D, 1, 0, 0),            /* LHU r1 = 0xBEEF (little-endian low half) */
+        enc_i(0x1C, 2, 0, 0),            /* LH  r2 = sign_ext(0xBEEF) = 0xFFFFBEEF */
+        enc_i(0x1F, 3, 0, 0),            /* LBU r3 = 0xEF (little-endian low byte) */
+        enc_i(0x1E, 4, 0, 0),            /* LB  r4 = sign_ext(0xEF) = 0xFFFFFFEF */
         enc_halt()
     };
     write_prog(0, prog, 6);
     run_to_halt(&cpu);
-    ASSERT(cpu.r[1] == 0xDEAD,     "LHU zero-extends");
-    ASSERT(cpu.r[2] == 0xFFFFDEAD, "LH sign-extends");
-    ASSERT(cpu.r[3] == 0xDE,       "LBU zero-extends");
-    ASSERT(cpu.r[4] == 0xFFFFFFDE, "LB sign-extends");
+    ASSERT(cpu.r[1] == 0xBEEF,     "LHU zero-extends");
+    ASSERT(cpu.r[2] == 0xFFFFBEEF, "LH sign-extends");
+    ASSERT(cpu.r[3] == 0xEF,       "LBU zero-extends");
+    ASSERT(cpu.r[4] == 0xFFFFFFEF, "LB sign-extends");
 }
 
 static void test_misaligned(void) {

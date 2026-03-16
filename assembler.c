@@ -307,13 +307,13 @@ static void emit_reloc(uint8_t type, int sym_idx, int32_t addend) {
     r->addend    = addend;
 }
 
-/* ── Big-endian file helpers (used by write_dobj) ────────────────────────── */
-static void wbe32(FILE *f, uint32_t v) {
-    fputc((v>>24)&0xFF,f); fputc((v>>16)&0xFF,f);
-    fputc((v>> 8)&0xFF,f); fputc( v     &0xFF,f);
+/* ── Little-endian file helpers (used by write_dobj) ────────────────────── */
+static void wle32(FILE *f, uint32_t v) {
+    fputc( v     &0xFF,f); fputc((v>> 8)&0xFF,f);
+    fputc((v>>16)&0xFF,f); fputc((v>>24)&0xFF,f);
 }
-static void wbe16(FILE *f, uint16_t v) {
-    fputc((v>>8)&0xFF,f); fputc(v&0xFF,f);
+static void wle16(FILE *f, uint16_t v) {
+    fputc(v&0xFF,f); fputc((v>>8)&0xFF,f);
 }
 
 /* Serialise assembled data to a .dobj object file. */
@@ -336,17 +336,17 @@ static void write_dobj(const char *path) {
     /* ── Header ── */
     fwrite(DOBJ_MAGIC, 1, 4, f);
     fputc(DOBJ_VERSION,f); fputc(0,f); fputc(0,f); fputc(0,f);  /* pad */
-    wbe32(f, 1);           /* num_sections */
-    wbe32(f, n_sym);
-    wbe32(f, n_rel);
-    wbe32(f, data_off);
+    wle32(f, 1);           /* num_sections */
+    wle32(f, n_sym);
+    wle32(f, n_rel);
+    wle32(f, data_off);
 
     /* ── Section header (.text) ── */
     { char n[8]; memset(n,0,8); memcpy(n,".text",5); fwrite(n,1,8,f); }
-    wbe32(f, 0);                              /* offset within data blob */
-    wbe32(f, sec_size);
-    wbe32(f, g_section_vma_hint);
-    wbe32(f, DOBJ_SF_EXEC | DOBJ_SF_ALLOC);
+    wle32(f, 0);                              /* offset within data blob */
+    wle32(f, sec_size);
+    wle32(f, g_section_vma_hint);
+    wle32(f, DOBJ_SF_EXEC | DOBJ_SF_ALLOC);
 
     /* ── Symbols ── */
     for (int i = 0; i < sym_count; i++) {
@@ -356,8 +356,8 @@ static void write_dobj(const char *path) {
         fwrite(n, 1, 28, f);
         /* value: section-relative offset; 0 for externs */
         uint32_t val = s->is_extern ? 0 : (s->addr - g_section_base);
-        wbe32(f, val);
-        wbe16(f, s->is_extern ? (uint16_t)DOBJ_SEC_UNDEF : (uint16_t)0);
+        wle32(f, val);
+        wle16(f, s->is_extern ? (uint16_t)DOBJ_SEC_UNDEF : (uint16_t)0);
         fputc(s->is_global ? 1 : 0, f);
         fputc(0, f);  /* pad */
     }
@@ -365,12 +365,12 @@ static void write_dobj(const char *path) {
     /* ── Relocations ── */
     for (int i = 0; i < reloc_count; i++) {
         ObjReloc *r = &reloc_tab[i];
-        wbe32(f, r->offset);
-        wbe32(f, r->sym_index);
+        wle32(f, r->offset);
+        wle32(f, r->sym_index);
         fputc(r->type, f);
         fputc(0, f);  /* section_index = 0 (single .text section) */
         fputc(0,f); fputc(0,f);  /* pad */
-        wbe32(f, (uint32_t)r->addend);
+        wle32(f, (uint32_t)r->addend);
     }
 
     /* ── Section data ── */
@@ -590,10 +590,10 @@ static void emit_byte(uint8_t b) {
 }
 
 static void emit_word(uint32_t w) {
-    emit_byte((w >> 24) & 0xFF);
-    emit_byte((w >> 16) & 0xFF);
-    emit_byte((w >>  8) & 0xFF);
     emit_byte( w        & 0xFF);
+    emit_byte((w >>  8) & 0xFF);
+    emit_byte((w >> 16) & 0xFF);
+    emit_byte((w >> 24) & 0xFF);
 }
 
 /* ── Instruction size calculator ─────────────────────────────────────────── */
