@@ -1,7 +1,7 @@
 #!/bin/sh
-# cputwo-cc — compile and link C programs for CPUTwo bare-metal
+# cputwocc.sh — compile and link C programs for CPUTwo bare-metal
 #
-# Usage: cputwo-cc [tcc options] file.c ... -o output.elf
+# Usage: ./cputwocc.sh [options] file.c ... -o output
 
 SCRIPTDIR=$(cd "$(dirname "$0")" && pwd)
 TINYCC="$SCRIPTDIR/../tinycc_CPUTwo/cputwo-tcc"
@@ -14,4 +14,3 @@ exec "$TINYCC" \
     -I"$PDCLIB/platform/cputwo/include" \
     "$@" \
     "$PDCLIB/platform/cputwo/libpdclib.a"
-
