@@ -237,6 +237,81 @@ Breakpoints are implemented by patching a `SYSCALL` instruction over the target 
 
 ---
 
+## C Toolchain
+
+CPUTwo has a full C toolchain built from two companion repositories:
+
+| Repository | Purpose |
+|---|---|
+| [`../tinycc_CPUTwo`](https://github.com/jhonsrid/tinycc_CPUTwo) | TCC cross-compiler targeting CPUTwo (`cputwo-tcc`) |
+| [`../pdclib_CPUTwo`](https://github.com/jhonsrid/pdclib_CPUTwo) | pdclib C standard library ported to CPUTwo bare-metal |
+
+### Building the compiler
+
+```sh
+cd ../tinycc_CPUTwo
+make
+```
+
+Produces `cputwo-tcc`, a cross-compiler that emits 32-bit ELF executables for CPUTwo (machine type `0x9002`).
+
+### Building the C standard library
+
+```sh
+cd ../pdclib_CPUTwo/platform/cputwo
+make CC=../../../tinycc_CPUTwo/cputwo-tcc WITH_DLMALLOC=1
+```
+
+Produces `libpdclib.a` (~400 KB), which includes:
+
+- Full C99 stdio (`printf`, `scanf`, `sprintf`, …) — backed by the UART at `0x03F00000`
+- stdlib (`malloc`, `free`, `realloc`, `calloc`) — backed by dlmalloc with a 512 KB static heap
+- string, math, time stubs, signal stubs
+
+### Compiling a program
+
+Use the `cputwo-cc` wrapper script in this repository:
+
+```sh
+./cputwo-cc hello.c -o hello.elf
+```
+
+It expands to:
+
+```sh
+cputwo-tcc -nostdlib -static \
+    -B../tinycc_CPUTwo \
+    -I../pdclib_CPUTwo/include \
+    -I../pdclib_CPUTwo/platform/cputwo/include \
+    hello.c \
+    ../pdclib_CPUTwo/platform/cputwo/libpdclib.a \
+    -o hello.elf
+```
+
+Any extra `cputwo-tcc` flags (e.g. `-g`, `-O2`, `-D`, `-I`) can be passed before the source files.
+
+### Running a compiled program
+
+Load the ELF into the emulator with the `-elf` flag (or strip it to a flat binary first):
+
+```sh
+./emulatortwo hello.elf
+```
+
+### UART I/O
+
+`printf` / `puts` / `scanf` etc. use the UART directly:
+
+| Register | Address | Description |
+|---|---|---|
+| Status | `0x03F00000` | bit 0 = TX ready, bit 1 = RX available |
+| TX data | `0x03F00004` | write one byte |
+| RX data | `0x03F00008` | read one byte |
+
+The library polls the status register before each byte — no interrupts required.
+
+---
+
 ## Tests
 
 ```

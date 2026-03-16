@@ -481,6 +481,16 @@ static void debugger_prompt(CPU *cpu, int debug) {
         char dis[80];
         uint32_t instr = (pc < MEM_SIZE) ? mem_read32(pc) : 0;
         disasm(pc, instr, dis, sizeof(dis));
+        uint32_t op_byte = instr >> 24;
+        if (debug == 2 && (op_byte == 0x0A || op_byte == 0x24 || op_byte == 0x25 || op_byte == 0x26)) {
+            /* DIV/DIVU/MOD/MODU: dump rs1 and rs2 values for debugging */
+            int _rd  = (instr >> 20) & 0xF;
+            int _rs1 = (instr >> 16) & 0xF;
+            int _rs2 = (instr >> 12) & 0xF;
+            fprintf(stderr, "[DIVDBG] 0x%08X: %s  r%d=0x%08X(%d) r%d=0x%08X(%d)\n",
+                    pc, dis, _rs1, cpu->r[_rs1], (int32_t)cpu->r[_rs1],
+                    _rs2, cpu->r[_rs2], (int32_t)cpu->r[_rs2]);
+        }
         fprintf(stderr, "[DBG] 0x%08X: %-40s > ", pc, dis);
         fflush(stderr);
         if (debug == 2) {
@@ -736,6 +746,61 @@ static void cpu_reset(CPU *cpu) {
     cpu->estatus = 0x02; /* user-mode + IE=1; default for first SYSRET */
 }
 
+/* ── ELF loader ──────────────────────────────────────────────────────────── */
+static uint16_t rd_le16(const uint8_t *p) {
+    return (uint16_t)((unsigned)p[0] | ((unsigned)p[1] << 8));
+}
+static uint32_t rd_le32(const uint8_t *p) {
+    return (uint32_t)((unsigned)p[0] | ((unsigned)p[1]<<8) |
+                      ((unsigned)p[2]<<16) | ((unsigned)p[3]<<24));
+}
+
+/* Returns entry point address on success, (uint32_t)-1 on error. */
+static uint32_t load_elf(FILE *f, const char *path) {
+    uint8_t hdr[52];
+    rewind(f);
+    if (fread(hdr, 1, 52, f) != 52) {
+        fprintf(stderr, "%s: truncated ELF header\n", path); return (uint32_t)-1;
+    }
+    if (hdr[4] != 1) { /* EI_CLASS != ELFCLASS32 */
+        fprintf(stderr, "%s: not a 32-bit ELF\n", path); return (uint32_t)-1;
+    }
+
+    uint32_t e_entry    = rd_le32(hdr + 24);
+    uint32_t e_phoff    = rd_le32(hdr + 28);
+    uint16_t e_phentsize= rd_le16(hdr + 42);
+    uint16_t e_phnum    = rd_le16(hdr + 44);
+
+    for (int i = 0; i < e_phnum; i++) {
+        uint8_t ph[32];
+        if (fseek(f, (long)(e_phoff + (uint32_t)i * e_phentsize), SEEK_SET) != 0 ||
+            fread(ph, 1, 32, f) != 32) {
+            fprintf(stderr, "%s: can't read program header %d\n", path, i);
+            return (uint32_t)-1;
+        }
+        if (rd_le32(ph + 0) != 1) continue; /* PT_LOAD = 1 */
+        uint32_t p_offset = rd_le32(ph + 4);
+        uint32_t p_vaddr  = rd_le32(ph + 8);
+        uint32_t p_filesz = rd_le32(ph + 16);
+        uint32_t p_memsz  = rd_le32(ph + 20);
+        if (p_vaddr + p_memsz > MEM_SIZE) {
+            fprintf(stderr, "%s: segment 0x%08X+0x%X exceeds memory\n",
+                    path, p_vaddr, p_memsz);
+            return (uint32_t)-1;
+        }
+        if (p_filesz > 0) {
+            if (fseek(f, (long)p_offset, SEEK_SET) != 0 ||
+                fread(mem + p_vaddr, 1, p_filesz, f) != p_filesz) {
+                fprintf(stderr, "%s: can't read segment data\n", path);
+                return (uint32_t)-1;
+            }
+        }
+        if (p_memsz > p_filesz)
+            memset(mem + p_vaddr + p_filesz, 0, p_memsz - p_filesz);
+    }
+    return e_entry;
+}
+
 /* ── Main ────────────────────────────────────────────────────────────────── */
 int main(int argc, char **argv) {
     static CPU cpu;
@@ -768,16 +833,29 @@ int main(int argc, char **argv) {
 
     FILE *f = fopen(binary, "rb");
     if (!f) { perror(binary); return 1; }
-    size_t n = fread(mem + load_addr, 1, MEM_SIZE - load_addr, f);
-    fclose(f);
-    (void)n;
+
+    /* Detect ELF by magic */
+    uint8_t magic[4] = {0};
+    (void)fread(magic, 1, 4, f);
+    int is_elf = (magic[0]==0x7f && magic[1]=='E' && magic[2]=='L' && magic[3]=='F');
+
+    if (is_elf) {
+        uint32_t entry = load_elf(f, binary);
+        fclose(f);
+        if (entry == (uint32_t)-1) return 1;
+        cpu.r[15] = entry;
+    } else {
+        rewind(f);
+        size_t n = fread(mem + load_addr, 1, MEM_SIZE - load_addr, f);
+        fclose(f);
+        (void)n;
+        cpu.r[15] = load_addr;
+    }
 
     if (blk_path) {
         cpu.blk_file = fopen(blk_path, "r+b");
         if (!cpu.blk_file) { perror(blk_path); return 1; }
     }
-
-    cpu.r[15] = load_addr;
 
     cpu_run(&cpu, debug);
 
