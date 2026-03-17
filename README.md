@@ -175,6 +175,24 @@ When launched with `-d`, execution pauses before every instruction:
 
 The `-e` trace mode is non-interactive — it prints the program counter and disassembly of every instruction to stderr and lets the program run to completion.
 
+### Terminal handling
+
+When stdin is a terminal, the emulator switches to **raw mode** so that each keystroke is delivered immediately to the guest OS (no host-side line buffering or echo). The terminal is restored on exit, on SIGINT, and on SIGTERM.
+
+When stdin is a pipe or file, raw mode is skipped and input is passed through unmodified.
+
+### Escape key (Ctrl-A)
+
+In raw mode, **Ctrl-A** is an escape prefix (same convention as QEMU and `screen`):
+
+| Sequence | Action |
+|---|---|
+| `Ctrl-A z` | Suspend the emulator (SIGTSTP) — equivalent to Ctrl-Z in a normal terminal. Terminal settings are restored before suspend and re-entered on resume. |
+| `Ctrl-A x` | Quit the emulator cleanly |
+| `Ctrl-A a` | Send a literal Ctrl-A to the guest |
+
+All other characters, including Ctrl-C and Ctrl-D, are passed directly to the guest OS.
+
 ### UART
 
 The emulator maps the UART to stdin/stdout. TX writes go to stdout immediately. RX bytes are read from stdin with a non-blocking poll each instruction cycle, so programs that spin on the UART status register work correctly.

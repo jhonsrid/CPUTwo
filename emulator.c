@@ -5,6 +5,40 @@
 #include <stdint.h>
 #include <sys/select.h>
 #include <unistd.h>
+#include <termios.h>
+#include <signal.h>
+
+/* ── Terminal raw mode ──────────────────────────────────────────────────── */
+static struct termios orig_termios;
+static int            termios_saved = 0;
+
+static void restore_termios(void) {
+    if (termios_saved)
+        tcsetattr(STDIN_FILENO, TCSAFLUSH, &orig_termios);
+}
+
+static void sighandler(int sig) {
+    (void)sig;
+    restore_termios();
+    _exit(128 + sig);
+}
+
+static void enable_raw_mode(void) {
+    if (!isatty(STDIN_FILENO)) return;   /* piped input — leave alone */
+    if (tcgetattr(STDIN_FILENO, &orig_termios) < 0) return;
+    termios_saved = 1;
+    atexit(restore_termios);
+    signal(SIGINT,  sighandler);
+    signal(SIGTERM, sighandler);
+
+    struct termios raw = orig_termios;
+    raw.c_iflag &= ~(ICRNL | IXON | BRKINT | INPCK | ISTRIP);
+    /* Keep OPOST so \n → \r\n translation works for xv6 output */
+    raw.c_lflag &= ~(ECHO | ICANON | ISIG | IEXTEN);
+    raw.c_cc[VMIN]  = 0;         /* non-blocking */
+    raw.c_cc[VTIME] = 0;
+    tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw);
+}
 
 /* ── Memory ──────────────────────────────────────────────────────────────── */
 #define MEM_SIZE   0x04000000u
@@ -565,21 +599,57 @@ static int cpu_fetch(CPU *cpu, uint32_t pc, uint32_t *instr_out) {
 }
 
 /* ── UART RX poll (non-blocking stdin check) ─────────────────────────────── */
-static void uart_poll(CPU *cpu) {
-    if (cpu->uart_rx_ready) return; /* already have a byte buffered */
+/* Escape prefix: Ctrl-A.  After Ctrl-A:
+ *   z — suspend emulator (SIGTSTP)
+ *   x — quit emulator
+ *   a — send literal Ctrl-A to guest
+ * Any other key after Ctrl-A is sent to the guest as-is.            */
+static int escape_pending = 0;
+
+static int read_one(void) {
     fd_set fds;
     struct timeval tv = {0, 0};
     FD_ZERO(&fds);
     FD_SET(STDIN_FILENO, &fds);
     if (select(STDIN_FILENO + 1, &fds, NULL, NULL, &tv) > 0) {
-        int c = getchar();
-        if (c != EOF) {
-            cpu->uart_rx_byte  = (uint8_t)c;
-            cpu->uart_rx_ready = 1;
-            if (cpu->uart_control & 0x01) /* RX irq enable */
-                cpu->ic_pending |= 0x02;
-        }
+        unsigned char ch;
+        if (read(STDIN_FILENO, &ch, 1) == 1)
+            return ch;
     }
+    return -1;
+}
+
+static void uart_poll(CPU *cpu) {
+    if (cpu->uart_rx_ready) return; /* already have a byte buffered */
+
+    int c = read_one();
+    if (c < 0) return;
+
+    if (escape_pending) {
+        escape_pending = 0;
+        if (c == 'z' || c == 'Z') {
+            restore_termios();
+            raise(SIGTSTP);          /* suspend */
+            enable_raw_mode();       /* resume — re-enter raw mode */
+            return;
+        }
+        if (c == 'x' || c == 'X') {
+            restore_termios();
+            fprintf(stderr, "\n[emulatortwo: quit]\n");
+            exit(0);
+        }
+        if (c == 'a')              /* literal Ctrl-A */
+            c = 0x01;
+        /* else: fall through and deliver c to guest */
+    } else if (c == 0x01) {       /* Ctrl-A */
+        escape_pending = 1;
+        return;
+    }
+
+    cpu->uart_rx_byte  = (uint8_t)c;
+    cpu->uart_rx_ready = 1;
+    if (cpu->uart_control & 0x01)  /* RX irq enable */
+        cpu->ic_pending |= 0x02;
 }
 
 /* ── Timer tick ──────────────────────────────────────────────────────────── */
@@ -1133,8 +1203,10 @@ int main(int argc, char **argv) {
         if (!cpu.blk_file) { perror(blk_path); return 1; }
     }
 
+    enable_raw_mode();
     cpu_run(&cpu, debug);
 
+    restore_termios();
     if (cpu.blk_file) fclose(cpu.blk_file);
     return cpu.halted ? 0 : (int)cpu.cause;
 }
