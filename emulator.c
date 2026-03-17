@@ -454,7 +454,7 @@ static uint32_t mmio_read(CPU *cpu, uint32_t addr) {
 
 static void mmio_write(CPU *cpu, uint32_t addr, uint32_t val) {
     /* Supervisor registers */
-    if (addr >= SV_BASE && addr <= SV_BASE+0x1C) {
+    if (addr >= SV_BASE && addr <= SV_BASE+0x20) {
         if (!(cpu->status & 1)) { raise_exception(cpu, 0x02); return; }
         switch (addr - SV_BASE) {
             case 0x00: cpu->epc    = val; break;
@@ -468,6 +468,17 @@ static void mmio_write(CPU *cpu, uint32_t addr, uint32_t val) {
                 tlb_flush_non_global(); /* writing SATP flushes non-global TLB entries */
                 break;
             case 0x1C: break; /* badaddr read-only */
+            case 0x20: {
+                /* WFI — Wait For Interrupt / event.
+                 * Block until stdin has data or 10 ms elapses.
+                 * Reduces host CPU usage when the guest is idle. */
+                fd_set fds;
+                struct timeval tv = {0, 10000}; /* 10 ms */
+                FD_ZERO(&fds);
+                FD_SET(STDIN_FILENO, &fds);
+                select(STDIN_FILENO + 1, &fds, NULL, NULL, &tv);
+                break;
+            }
         }
         return;
     }
