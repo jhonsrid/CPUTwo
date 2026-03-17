@@ -477,7 +477,11 @@ static void mmio_write(CPU *cpu, uint32_t addr, uint32_t val) {
             case 0x00: cpu->blk_sector  = val; break;
             case 0x04: cpu->blk_buffer  = val; break;
             case 0x08: { /* command */
-                if (!cpu->blk_file) { cpu->blk_status = 2; break; }
+                if (!cpu->blk_file) {
+                    fprintf(stderr, "Error: block I/O attempted but no -blk parameter provided\n");
+                    cpu->blk_status = 2;
+                    break;
+                }
                 if (cpu->blk_buffer & 0x1FF) { cpu->blk_status = 2; break; } /* must be 512-byte aligned */
                 cpu->blk_status = 1;
                 if (val == 1) { /* read */
@@ -738,7 +742,6 @@ static void debugger_prompt(CPU *cpu, int debug) {
         uint32_t op_byte = instr >> 24;
         if (debug == 2 && (op_byte == 0x0A || op_byte == 0x24 || op_byte == 0x25 || op_byte == 0x26)) {
             /* DIV/DIVU/MOD/MODU: dump rs1 and rs2 values for debugging */
-            int _rd  = (instr >> 20) & 0xF;
             int _rs1 = (instr >> 16) & 0xF;
             int _rs2 = (instr >> 12) & 0xF;
             fprintf(stderr, "[DIVDBG] 0x%08X: %s  r%d=0x%08X(%d) r%d=0x%08X(%d)\n",
