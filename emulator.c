@@ -91,7 +91,7 @@ typedef struct {
     uint32_t cause;
     uint32_t status;    /* bit0=priv(1=sv) bit1=IE */
     int halted;
-    uint32_t estatus;    /* STATUS saved on exception entry; restored by SYSRET */
+    uint32_t estatus;    /* STATUS saved on exception entry; restored by SYSRET/KRET */
     uint32_t uart_poll_divider; /* counts instructions; poll only every 1000 */
     uint32_t faulting_pc; /* PC of the currently-executing instruction */
 
@@ -410,7 +410,6 @@ static uint32_t mmio_read(CPU *cpu, uint32_t addr) {
                 if (!cpu->uart_rx_ready) return 0;
                 uint8_t b = cpu->uart_rx_byte;
                 cpu->uart_rx_ready = 0;
-                cpu->ic_pending &= ~0x02u; /* clear RX pending on read */
                 return (uint32_t)b;
             }
             case 0x0C: return cpu->uart_control;
@@ -1083,10 +1082,12 @@ static void cpu_run(CPU *cpu, int debug) {
             cpu->r[15]  = cpu->epc;
             cpu->flags  = cpu->eflags;
             cpu->status = cpu->estatus; /* restore full STATUS including IE; keep supervisor bit */
-            /* Skip interrupt_check on this iteration — we just restored state
-             * and need to execute at least one instruction at the return address
-             * before servicing another interrupt. This prevents an infinite
-             * interrupt loop when IE=1 and a timer is immediately pending. */
+            /* Do timer/uart housekeeping but skip interrupt_check — we just
+             * restored IE and need at least one instruction at the return
+             * address before servicing another interrupt.  Without this,
+             * KRET + immediately-pending timer = infinite interrupt loop. */
+            timer_tick(cpu);
+            if (++cpu->uart_poll_divider >= 1000) { cpu->uart_poll_divider = 0; uart_poll(cpu); }
             continue;
 
         default:
@@ -1105,7 +1106,7 @@ static void cpu_run(CPU *cpu, int debug) {
 static void cpu_reset(CPU *cpu) {
     memset(cpu, 0, sizeof(*cpu));
     cpu->status = 0x01; /* supervisor, IE=0 */
-    cpu->estatus = 0x02; /* user-mode + IE=1; default for first SYSRET */
+    cpu->estatus = 0x02; /* user-mode + IE=1; default for first SYSRET/KRET */
     /* satp = 0: MMU disabled (EN bit = 0) */
     tlb_flush_all();
 }
