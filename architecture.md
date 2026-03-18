@@ -234,7 +234,7 @@ All branches use opcode `0x0D`. The `cond` field (bits 23–20) selects the cond
 - `lr` (`r14`): return address (set by `JMP`)
 - `pc` (`r15`): program counter
 
-> **`lr` is clobbered by every kernel trap.** On any exception entry (SYSCALL, hardware interrupt, or fault) the hardware uses `r14` as a scratch register before the first instruction of the handler executes, irrecoverably destroying the user's `lr` value. User code must treat `lr` as **volatile across any SYSCALL boundary** — a value stored in `lr` that is not also saved on the stack will be lost. Subroutine call-and-return code is unaffected because the return address is already saved on the stack (or consumed before the syscall), but storing data in `lr` across a syscall is not safe.
+> **`lr` is preserved across trap entry.** The hardware dispatches to exception handlers via an internal vector table lookup that does not modify any general-purpose register. All 16 GPRs (r0–r15, including lr) retain their pre-trap values when the first instruction of the handler executes — except `pc` (r15), which is set to the handler address. The handler is responsible for saving any registers it needs to use as scratch (the xv6 trampoline, for example, saves all registers to a per-process trapframe).
 
 Stack is **full-descending** (sp points to last pushed item, grows downward). `sp` must be **4-byte aligned** at every call boundary; the callee may assume this on entry.
 
@@ -325,13 +325,14 @@ Two modes only — **User** and **Supervisor**.
 
 ### SYSCALL Entry Sequence (hardware)
 
-1. Save `PC + 4` → `EPC` (return address past the SYSCALL instruction)
-2. Save `flags` → `EFLAGS`
-3. Set `CAUSE` = 0x03 (syscall)
-4. Set `STATUS` = 0x01 (supervisor mode, IE cleared — interrupts disabled)
-5. Jump to `mem32[EVEC + (3 * 4)]` (the syscall handler address)
+1. Save `STATUS` → `ESTATUS`
+2. Save `PC + 4` → `EPC` (return address past the SYSCALL instruction)
+3. Save `flags` → `EFLAGS`
+4. Set `CAUSE` = 0x03 (syscall)
+5. Set `STATUS` = 0x01 (supervisor mode, IE cleared — interrupts disabled)
+6. Jump to `mem32[EVEC + (3 * 4)]` (the syscall handler address)
 
-**SYSCALL in supervisor mode** triggers a double fault. See Double Fault.
+SYSCALL in supervisor mode follows the same sequence — ESTATUS/EPC/EFLAGS are overwritten with the current supervisor state. The handler must save these to the stack before executing any instruction that could cause another exception.
 
 ### SYSRET Sequence (hardware)
 
@@ -351,19 +352,22 @@ Two modes only — **User** and **Supervisor**.
 
 ### Exception Entry Sequence (hardware, all causes except SYSCALL)
 
-1. **Double-fault check**: if already in supervisor mode (STATUS bit 0 = 1), halt immediately — see Double Fault below.
-2. Save `STATUS` → `ESTATUS`
-3. Save faulting `PC` → `EPC`
-4. Save `flags` → `EFLAGS`
-5. Write cause code → `CAUSE`
-6. Set `STATUS` = `0x01` (supervisor mode, IE cleared — interrupts disabled)
-7. Jump to `mem32[EVEC + (CAUSE * 4)]`
+1. Save `STATUS` → `ESTATUS`
+2. Save faulting `PC` → `EPC`
+3. Save `flags` → `EFLAGS`
+4. Write cause code → `CAUSE`
+5. Set `STATUS` = `0x01` (supervisor mode, IE cleared — interrupts disabled)
+6. Load handler address internally from `mem32[EVEC + (CAUSE * 4)]` and write it to `PC`
+
+No general-purpose register is modified during dispatch — all GPRs (r0–r14) retain their pre-exception values. Only PC (r15) is changed to the handler address.
 
 > **Hardware interrupt exception (cause 6)**: EPC is set to the address of the *next* instruction that would have executed — i.e. `PC` as it stood after the last instruction completed and the processor was about to fetch again. This differs from true fault causes (0–4) where EPC is the address of the faulting instruction itself. An OS interrupt handler can restore EPC directly into the supervisor register to resume the interrupted task without adjustment.
 
-### Double Fault
+### Nested Exceptions
 
-If any exception or interrupt is triggered while the CPU is already in supervisor mode (STATUS bit 0 = 1), the CPU **halts immediately** without dispatching to a handler and without modifying any registers. `EPC`, `EFLAGS`, and `CAUSE` retain the values from the first exception. The emulator treats this identically to a HALT instruction.
+Exceptions in supervisor mode are dispatched normally through the EVEC table using the same entry sequence above. Because STATUS.IE is cleared on every exception entry, hardware interrupts cannot fire during a handler unless the handler explicitly sets IE=1.
+
+A handler that re-enables interrupts or accesses potentially invalid memory must first save EPC, ESTATUS, and EFLAGS to the stack, since a nested exception's entry sequence would overwrite them. Failure to do so before a nested trap causes the outer exception's saved state to be lost.
 
 ### Interrupt Dispatch
 
@@ -499,9 +503,9 @@ The emulator maintains a 64-entry direct-mapped TLB. Each entry caches the resul
 
 An OS must execute SFENCE or write SATP after modifying page table entries to ensure stale TLB entries are not used.
 
-### Double Fault with Page Faults
+### Page Faults in Supervisor Mode
 
-The standard double-fault rule applies: if a page fault (cause 0x07–0x09) occurs while the CPU is already in supervisor mode (STATUS bit 0 = 1), the CPU **halts immediately** without dispatching a handler. This prevents infinite recursive fault loops. Supervisor code must ensure its own instruction pages and data pages are always valid.
+Page faults in supervisor mode are dispatched normally through the EVEC table, like any other exception. If a handler faults recursively (e.g., the page-fault handler itself takes a page fault), the nested exception overwrites EPC, ESTATUS, and EFLAGS unless the handler has already saved them to the stack. Supervisor code should ensure its own instruction and stack pages are always valid to avoid unrecoverable recursive faults.
 
 ---
 
@@ -594,7 +598,7 @@ Typical init sequence: set device enable → set IC mask → set `STATUS.IE` las
 | Separate R/I opcodes | Avoids a mode-select bit inside the encoding; each opcode has exactly one format |
 | EFLAGS supervisor register | SYSRET can restore user flags atomically without extra instructions |
 | Memory-mapped supervisor registers | No CSR instructions needed; normal LW/SW in supervisor mode are sufficient |
-| Double fault → halt | Simplest safe failure mode; avoids recursive exception machinery |
+| Supervisor-mode exceptions dispatch normally | Exceptions in supervisor mode use the same entry sequence with IE=0; kernel saves EPC/ESTATUS/EFLAGS to the stack before anything can nest. Enables interrupt-driven I/O and page fault recovery in the kernel. |
 | Sv32-compatible MMU | Two-level page tables with 4 KB pages and optional 4 MB superpages match the RISC-V Sv32 format, enabling direct reuse of xv6 and Linux page table code with minimal porting |
 | MMIO bypass (>= 0x03F00000) | Supervisor registers and devices are always accessible at their physical addresses regardless of SATP.EN — no need to map MMIO into every process's page table |
 | SATP write flushes TLB | Implicit flush on context switch; eliminates a separate required SFENCE in the common case |

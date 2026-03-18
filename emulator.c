@@ -147,10 +147,6 @@ static void mmio_write(CPU *cpu, uint32_t addr, uint32_t val);
 
 /* ── Exception dispatch ──────────────────────────────────────────────────── */
 static void raise_exception(CPU *cpu, uint32_t cause) {
-    if (cpu->status & 1) { /* double fault */
-        cpu->halted = 1;
-        return;
-    }
     cpu->estatus = cpu->status; /* save STATUS before clobbering it */
     cpu->epc    = cpu->faulting_pc;
     cpu->eflags = cpu->flags;
@@ -1062,8 +1058,7 @@ static void cpu_run(CPU *cpu, int debug) {
 
         /* ── Syscall/Sysret/Halt ── */
         case 0x10: /* SYSCALL */
-            if (cpu->status & 1) { cpu->halted=1; break; } /* double fault */
-            cpu->estatus = cpu->status; /* save STATUS before clobbering it */
+            cpu->estatus = cpu->status;
             cpu->epc    = cpu->r[15]; /* already pc+4 */
             cpu->eflags = cpu->flags;
             cpu->cause  = 0x03;
