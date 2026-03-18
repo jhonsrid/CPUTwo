@@ -62,12 +62,12 @@ Supervisor registers are **memory-mapped** into the CPU control region at `0x03F
 
 | Address | Register | Purpose |
 |---|---|---|
-| `0x03FFF000` | `EPC` | PC saved on entry — faulting instruction address for exceptions; `PC + 4` (return address) for SYSCALL. **Read/write**: write to adjust the return address before SYSRET. |
-| `0x03FFF004` | `EFLAGS` | `flags` register saved on entry. Restored by SYSRET. **Read/write**: write to alter the flags SYSRET restores. |
+| `0x03FFF000` | `EPC` | PC saved on entry — faulting instruction address for exceptions; `PC + 4` (return address) for SYSCALL. **Read/write**: write to adjust the return address before SYSRET/KRET. |
+| `0x03FFF004` | `EFLAGS` | `flags` register saved on entry. Restored by SYSRET/KRET. **Read/write**: write to alter the flags restored on return. |
 | `0x03FFF008` | `EVEC` | Base address of the exception vector table. **Read/write**: must be written before enabling interrupts. |
 | `0x03FFF00C` | `CAUSE` | Most recent exception cause code. **Read-only** — writes ignored. |
 | `0x03FFF010` | `STATUS` | Bit 0 = privilege (0 = User, 1 = Supervisor); bit 1 = IE (1 = interrupts enabled); bits 31–2 reserved. **Read/write.** |
-| `0x03FFF014` | `ESTATUS` | Exception-entry snapshot of `STATUS`. Saved automatically on every exception entry; restored by SYSRET (with bit 0 forced clear). **Read/write**: write before SYSRET to control the IE bit the returning task will see. |
+| `0x03FFF014` | `ESTATUS` | Exception-entry snapshot of `STATUS`. Saved automatically on every exception entry; restored by SYSRET (with bit 0 forced clear) or KRET (exact restore). **Read/write**: write before SYSRET/KRET to control the STATUS the returning code will see. |
 | `0x03FFF018` | `SATP` | Supervisor Address Translation & Protection. Bit 31 = EN (1 = MMU enabled). Bits [19:0] = PPN of root L1 page table (physical address of L1 table = PPN << 12). Writing SATP implicitly flushes all non-global TLB entries. Reset value = 0 (MMU disabled). **Read/write.** |
 | `0x03FFF01C` | `BADADDR` | Faulting virtual address — written by hardware on page fault (causes 0x07–0x09). **Read-only**; writes ignored. |
 
@@ -104,7 +104,7 @@ Bit positions (bit 31 = MSB):
 
 **offset20 extraction**: The 20-bit signed byte offset in B-type and J-type spans bits 19–0. Sign-extend to 32 bits before adding to PC. Range: ±512 KB.
 
-**Unused fields**: For instructions with no source register (MOVI, MOVHI), the rs1 field (bits 19–16) is ignored by the CPU and must be written as zero by the assembler. For instructions with no operands at all (SYSCALL, SYSRET, HALT), all bits below the opcode are ignored and must be zero.
+**Unused fields**: For instructions with no source register (MOVI, MOVHI), the rs1 field (bits 19–16) is ignored by the CPU and must be written as zero by the assembler. For instructions with no operands at all (SYSCALL, SYSRET, KRET, HALT, SFENCE), all bits below the opcode are ignored and must be zero.
 
 ---
 
@@ -399,7 +399,7 @@ The interrupt controller's enable mask (`0x03F02004`) is checked as part of step
 | 0x00 | Illegal instruction | Unknown opcode, reserved encoding, or privileged instruction in user mode |
 | 0x01 | Misaligned access | LW/SW to non-word-aligned address; LH/SH to non-halfword-aligned address |
 | 0x02 | Bus error | Address outside valid memory range or fetch past end of memory |
-| 0x03 | Syscall | `SYSCALL` instruction executed in user mode |
+| 0x03 | Syscall | `SYSCALL` instruction executed |
 | 0x04 | Divide by zero | `DIV`, `DIVU`, `MOD`, or `MODU` with zero divisor |
 | 0x05 | Halt | `HALT` instruction — not a true exception; stops the emulator cleanly |
 | 0x06 | Hardware interrupt | Any unmasked hardware interrupt fired — read IC pending register (`0x03F02000`) to identify source: bit 0 = timer, bit 1 = UART RX, bit 2 = UART TX, bit 3 = block device |
