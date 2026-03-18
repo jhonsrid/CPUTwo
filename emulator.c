@@ -773,6 +773,7 @@ static void disasm(uint32_t addr, uint32_t instr, char *buf, size_t sz) {
         case 0x3C: snprintf(buf,sz,"RORI %s,%s,%u",reg_name(rd),reg_name(rs1),shift); break;
         case 0x3D: snprintf(buf,sz,"CAS  %s,%s,%s",reg_name(rd),reg_name(rs1),reg_name(rs2)); break;
         case 0x3E: snprintf(buf,sz,"SFENCE"); break;
+        case 0x3F: snprintf(buf,sz,"KRET"); break;
         default:   snprintf(buf,sz,"??? (0x%08X)",instr); break;
     }
 }
@@ -1076,6 +1077,17 @@ static void cpu_run(CPU *cpu, int debug) {
         case 0x12: /* HALT */
             cpu->halted = 1;
             break;
+
+        case 0x3F: /* KRET — kernel return (like SYSRET but keeps supervisor mode) */
+            if (!(cpu->status & 1)) { raise_exception(cpu, 0x00); break; } /* user mode → illegal */
+            cpu->r[15]  = cpu->epc;
+            cpu->flags  = cpu->eflags;
+            cpu->status = cpu->estatus; /* restore full STATUS including IE; keep supervisor bit */
+            /* Skip interrupt_check on this iteration — we just restored state
+             * and need to execute at least one instruction at the return address
+             * before servicing another interrupt. This prevents an infinite
+             * interrupt loop when IE=1 and a timer is immediately pending. */
+            continue;
 
         default:
             raise_exception(cpu, 0x00);

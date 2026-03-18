@@ -177,6 +177,7 @@ R-type register operand and I-type immediate operand variants are **separate opc
 | 0x3C | RORI  | R | `rd = (rs1 >> sh) \| (rs1 << (32 - sh))` — rotate right by immediate (shift field, 0..31) |
 | 0x3D | CAS | R | Atomic compare-and-swap: `tmp = mem32[rs1]`; if `tmp == rd` then `mem32[rs1] = rs2`, `Z=1`; else `rd = tmp`, `Z=0`. Raises misaligned (cause 1) if `rs1` is not word-aligned. N, C, V unchanged. |
 | 0x3E | SFENCE | — | Flush all TLB entries where G=0. No-op if MMU disabled. **Supervisor mode only** — raises illegal instruction (cause 0x00) if executed in user mode. All bits below the opcode are reserved and must be zero. |
+| 0x3F | KRET | — | Kernel return: atomically restore `PC = EPC`, `flags = EFLAGS`, `STATUS = ESTATUS`. **Supervisor mode only** — raises illegal instruction (cause 0x00) if executed in user mode. All bits below the opcode are reserved and must be zero. |
 
 Indexed memory instructions use the **R-type** encoding with `rs2` as the index register instead of an immediate offset. Alignment rules are identical to their non-indexed counterparts: LWX/SWX require 4-byte alignment, LHX/LHUX/SHX require 2-byte alignment, byte operations have no alignment requirement.
 
@@ -341,6 +342,18 @@ SYSCALL in supervisor mode follows the same sequence — ESTATUS/EPC/EFLAGS are 
 3. Set `STATUS` = `ESTATUS & ~1` (restores IE from ESTATUS; bit 0 forced to 0 — always returns to user mode)
 
 **SYSRET executed in user mode**: raises an illegal instruction exception (cause 0x00).
+
+### KRET Sequence (hardware)
+
+1. Set `PC` = `EPC`
+2. Set `flags` = `EFLAGS`
+3. Set `STATUS` = `ESTATUS` (restores full STATUS including IE and privilege bit)
+
+KRET is the kernel-mode counterpart of SYSRET. Where SYSRET forces bit 0 of STATUS to 0 (always returns to user mode), KRET restores STATUS exactly from ESTATUS, preserving the supervisor bit. This allows a kernel interrupt handler to atomically restore the interrupted kernel code's `PC`, `flags`, and `STATUS` (including IE) without a window where a nested interrupt could corrupt return state.
+
+Typical usage: a kernel trap handler saves EPC, EFLAGS, and ESTATUS to the stack on entry, handles the interrupt, writes the saved values back to the MMIO registers, and executes KRET.
+
+**KRET executed in user mode**: raises an illegal instruction exception (cause 0x00).
 
 ---
 
@@ -599,6 +612,7 @@ Typical init sequence: set device enable → set IC mask → set `STATUS.IE` las
 | EFLAGS supervisor register | SYSRET can restore user flags atomically without extra instructions |
 | Memory-mapped supervisor registers | No CSR instructions needed; normal LW/SW in supervisor mode are sufficient |
 | Supervisor-mode exceptions dispatch normally | Exceptions in supervisor mode use the same entry sequence with IE=0; kernel saves EPC/ESTATUS/EFLAGS to the stack before anything can nest. Enables interrupt-driven I/O and page fault recovery in the kernel. |
+| KRET for kernel return | Atomically restores PC, flags, and STATUS (including IE) from supervisor registers — eliminates the race window between re-enabling interrupts and jumping to the return address that would exist with separate instructions. Analogous to RISC-V's MRET/SRET. |
 | Sv32-compatible MMU | Two-level page tables with 4 KB pages and optional 4 MB superpages match the RISC-V Sv32 format, enabling direct reuse of xv6 and Linux page table code with minimal porting |
 | MMIO bypass (>= 0x03F00000) | Supervisor registers and devices are always accessible at their physical addresses regardless of SATP.EN — no need to map MMIO into every process's page table |
 | SATP write flushes TLB | Implicit flush on context switch; eliminates a separate required SFENCE in the common case |
